@@ -20,7 +20,8 @@ Lets you scan a running process's memory, find and change values (HP, coins, amm
 - ⚡ **Attach and Spawn** — attach to an already-running process, or have Frida spawn the app itself and inject before it starts.
 - ✏️ **In-place editing** — double-click any scan result or watch-list entry to edit its value directly.
 - 🎨 **Dark pink theme**, tabs, tooltips explaining every scan mode, scrollable layout (nothing gets cut off on small screens).
-
+  
+Developed with the help of Claude AI.
 ---
 
 ## 📋 Requirements

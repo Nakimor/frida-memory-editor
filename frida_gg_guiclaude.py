@@ -14,6 +14,10 @@ var freezeTimer = null;
 var watchList = [];   // { address(str), type, name, value, frozen }
 
 var TYPE_SIZE = { byte:1, int16:2, int32:4, int64:8, float:4, double:8 };
+// Допуск для сравнения float/double в nextScan (Изменилось/Не изменилось/Между и т.п.) —
+// гасит шум последних бит от накопленной погрешности вычислений движка, не влияет
+// на скорость, т.к. применяется только к уже найденным (маленькому списку) адресам.
+var FLOAT_EPSILON = { float: 0.0001, double: 0.000001 };
 
 function bytesToHex(ptrVal, len) {
     return Array.from(new Uint8Array(ptrVal.readByteArray(len)))
@@ -74,12 +78,26 @@ function valueToPattern(type, val) {
     return null;
 }
 
+// Актуальный адрес записи списка наблюдения — обычный сохранённый адрес
+// (уже мог быть выставлен как module+offset при добавлении/импорте, либо
+// это обычный heap-адрес, как и раньше).
+function resolveWatchAddress(w) {
+    try { return ptr(w.address); } catch (e) { return null; }
+}
+
 rpc.exports = {
 
     // ---------- поиск ----------
     firstScanExact: function (dataType, val) {
         matches = [];
         currentType = dataType;
+
+        // Для float/double первый поиск снова через Memory.scanSync (нативный, быстрый):
+        // ручной JS-проход по каждой ячейке памяти оказался неприемлемо медленным даже
+        // на небольших играх (десятки миллионов итераций в интерпретируемом JS против
+        // одного нативного вызова). Точное совпадение может изредка не находить значение
+        // из-за погрешности IEEE754 — доп. допуск (epsilon) для float всё ещё работает
+        // в nextScan при сужении результатов "Изменилось/Не изменилось/Между" и т.п.
         var pattern = valueToPattern(dataType, val);
         if (!pattern) return { count: 0 };
 
@@ -132,6 +150,7 @@ rpc.exports = {
     nextScan: function (mode, targetVal, targetVal2) {
         if (matches.length === 0) return 0;
         var isFloatType = (currentType === 'float' || currentType === 'double');
+        var eps = isFloatType ? FLOAT_EPSILON[currentType] : 0;
         var t1 = isFloatType ? parseFloat(targetVal) : parseInt(targetVal);
         var t2 = (targetVal2 !== undefined && targetVal2 !== null && targetVal2 !== '')
             ? (isFloatType ? parseFloat(targetVal2) : parseInt(targetVal2)) : null;
@@ -141,12 +160,12 @@ rpc.exports = {
             if (cur === null) return false;
             var prev = item.lastValue;
             var ok = false;
-            if (mode === 'eq') ok = (cur == t1);
-            else if (mode === 'neq') ok = (cur != t1);
-            else if (mode === 'inc') ok = (cur > prev);
-            else if (mode === 'dec') ok = (cur < prev);
-            else if (mode === 'changed') ok = (cur != prev);
-            else if (mode === 'unchanged') ok = (cur == prev);
+            if (mode === 'eq') ok = isFloatType ? (Math.abs(cur - t1) < eps) : (cur == t1);
+            else if (mode === 'neq') ok = isFloatType ? (Math.abs(cur - t1) >= eps) : (cur != t1);
+            else if (mode === 'inc') ok = isFloatType ? (cur > prev + eps) : (cur > prev);
+            else if (mode === 'dec') ok = isFloatType ? (cur < prev - eps) : (cur < prev);
+            else if (mode === 'changed') ok = isFloatType ? (Math.abs(cur - prev) >= eps) : (cur != prev);
+            else if (mode === 'unchanged') ok = isFloatType ? (Math.abs(cur - prev) < eps) : (cur == prev);
             else if (mode === 'between') ok = (t2 !== null && cur >= t1 && cur <= t2);
 
             if (ok) item.lastValue = cur;
@@ -171,16 +190,42 @@ rpc.exports = {
         return matches.length;
     },
 
-    // ---------- заморозка всех текущих результатов поиска ----------
-    toggleFreeze: function (enable, val) {
-        _restartFreezeTimer();
-        return _freezeAllEnabled;
+    // ---------- список наблюдения (cheat table) ----------
+    // Каждая запись, если адрес попадает в загруженный модуль (.so/.dll), дополнительно
+    // хранит { module, offset } — это позволяет пережить перезапуск процесса: адрес модуля
+    // после ASLR другой, но offset от его базы остаётся стабильным. Если адрес не в модуле
+    // (обычная куча) — модуль/offset остаются null, и работаем как раньше, по сырому адресу.
+    watchAdd: function (address, type, name, value) {
+        var entry = { address: address, module: null, offset: null,
+                       type: type, name: name || address, value: value, frozen: false };
+        try {
+            var m = Process.findModuleByAddress(ptr(address));
+            if (m) {
+                entry.module = m.name;
+                entry.offset = ptr(address).sub(m.base).toString();
+            }
+        } catch (e) {}
+        watchList.push(entry);
+        return watchList.length;
     },
 
-    // ---------- список наблюдения (cheat table) ----------
-    watchAdd: function (address, type, name, value) {
-        watchList.push({ address: address, type: type, name: name || address, value: value, frozen: false });
-        return watchList.length;
+    // Привязать УЖЕ СУЩЕСТВУЮЩУЮ запись к новому адресу (например, нашли значение
+    // заново после перезапуска игры) — вместо создания дубликата обновляем адрес
+    // (и module/offset, если новый адрес снова попадает в модуль) у той же записи.
+    watchUpdateAddress: function (oldAddress, newAddress) {
+        var w = watchList.find(w => w.address === oldAddress);
+        if (!w) return false;
+        w.address = newAddress;
+        w.module = null;
+        w.offset = null;
+        try {
+            var m = Process.findModuleByAddress(ptr(newAddress));
+            if (m) {
+                w.module = m.name;
+                w.offset = ptr(newAddress).sub(m.base).toString();
+            }
+        } catch (e) {}
+        return true;
     },
 
     watchRemove: function (address) {
@@ -194,11 +239,22 @@ rpc.exports = {
         return !!w;
     },
 
+    // Смена типа данных существующей записи "на лету" — значение после этого
+    // перечитывается уже как новый тип (адрес не меняется).
+    watchSetType: function (address, newType) {
+        var w = watchList.find(w => w.address === address);
+        if (!w) return false;
+        w.type = newType;
+        return true;
+    },
+
     watchSetValue: function (address, val) {
         var w = watchList.find(w => w.address === address);
         if (!w) return false;
         w.value = val;
-        return writeVal(w.address, w.type, val);
+        var addr = resolveWatchAddress(w);
+        if (!addr) return false;
+        return writeVal(addr, w.type, val);
     },
 
     watchToggleFreeze: function (address, enable) {
@@ -209,34 +265,100 @@ rpc.exports = {
     },
 
     watchList: function () {
-        return watchList.map(w => ({
-            address: w.address, type: w.type, name: w.name, frozen: w.frozen,
-            value: readVal(w.address, w.type)
-        }));
+        return watchList.map(function (w) {
+            var addr = resolveWatchAddress(w);
+            // держим w.address синхронизированным с последним резолвом — на нём завязан
+            // матчинг в watchRemove/watchRename/watchSetValue/watchToggleFreeze
+            if (addr) w.address = addr.toString();
+            return {
+                address: w.address, type: w.type, name: w.name, frozen: w.frozen,
+                module: w.module, offset: w.offset,
+                value: addr ? readVal(addr, w.type) : null
+            };
+        });
     },
 
     watchImport: function (entries) {
-        watchList = entries.map(e => ({ address: e.address, type: e.type, name: e.name, value: e.value, frozen: !!e.frozen }));
+        // При загрузке таблицы: если у записи есть module+offset — резолвим адрес заново
+        // относительно ТЕКУЩЕЙ базы модуля в этом процессе (после ASLR она другая, чем была
+        // при сохранении). Обычный heap-адрес без module — best-effort как раньше.
+        watchList = entries.map(function (e) {
+            var resolvedAddr = e.address;
+            var module = e.module || null;
+            var offset = e.offset || null;
+            if (module && offset) {
+                try {
+                    var m = Process.findModuleByName(module);
+                    if (m) resolvedAddr = m.base.add(ptr(offset)).toString();
+                } catch (err) {}
+            }
+            return { address: resolvedAddr, module: module, offset: offset,
+                     type: e.type, name: e.name, value: e.value, frozen: !!e.frozen };
+        });
         return watchList.length;
+    },
+
+    // ---------- инспектор памяти (соседние ячейки вокруг адреса) ----------
+    inspectMemory: function (baseAddress, startOffset, endOffset, step) {
+        var s = parseInt(startOffset), e = parseInt(endOffset), st = parseInt(step);
+        if (!st || st <= 0) return { error: 'bad_step' };
+        if (e < s) return { error: 'bad_range' };
+
+        var count = Math.floor((e - s) / st) + 1;
+        var CAP = 5000; // защита от зависания UI при слишком большом диапазоне
+        if (count > CAP) return { error: 'too_many', count: count };
+
+        var base;
+        try { base = ptr(baseAddress); } catch (err) { return { error: 'bad_address' }; }
+
+        var rows = [];
+        for (var off = s; off <= e; off += st) {
+            var addr;
+            try { addr = base.add(off); } catch (err) { continue; }
+
+            var row = { offset: off, address: addr.toString(), byte: null, int16: null,
+                        int32: null, int64: null, float: null, double: null, pointer: null };
+            try { row.byte = addr.readU8(); } catch (err) {}
+            try { row.int16 = addr.readS16(); } catch (err) {}
+            try { row.int32 = addr.readInt(); } catch (err) {}
+            try { row.int64 = addr.readS64().toString(); } catch (err) {}
+            try { row.float = parseFloat(addr.readFloat().toFixed(4)); } catch (err) {}
+            try { row.double = parseFloat(addr.readDouble().toFixed(6)); } catch (err) {}
+            try {
+                var p = addr.readPointer();
+                row.pointer = p.isNull() ? null : p.toString();
+            } catch (err) {}
+            rows.push(row);
+        }
+        return { rows: rows };
     }
 };
 
 var _freezeAllEnabled = false;
 var _freezeAllVal = null;
 
+// Единственное определение toggleFreeze (раньше было продублировано внутри rpc.exports = {...}
+// и там же тихо перезаписывалось этим — дублирующая заглушка была мёртвым кодом, убрана).
 rpc.exports.toggleFreeze = function (enable, val) {
     _freezeAllEnabled = enable;
     _freezeAllVal = val;
     return _freezeAllEnabled;
 };
 
+// Таймер заморозки запускается один раз при загрузке скрипта (а не "перезапускается" —
+// имя оставлено по историческим причинам) и живёт всё время сессии; когда нечего
+// замораживать, тик просто ничего не делает.
 function _restartFreezeTimer() {
     if (freezeTimer !== null) { clearInterval(freezeTimer); freezeTimer = null; }
     freezeTimer = setInterval(function () {
         if (_freezeAllEnabled && _freezeAllVal !== null) {
             matches.forEach(m => writeVal(m.address, currentType, _freezeAllVal));
         }
-        watchList.forEach(w => { if (w.frozen) writeVal(w.address, w.type, w.value); });
+        watchList.forEach(w => {
+            if (!w.frozen) return;
+            var addr = resolveWatchAddress(w);
+            if (addr) writeVal(addr, w.type, w.value);
+        });
     }, 50);
 }
 _restartFreezeTimer();
@@ -377,12 +499,133 @@ class MemoryEditorApp:
         self.freeze_all_on = False
         self.watch_autorefresh = tk.BooleanVar(value=True)
         self._watch_job = None
+        self._detach_notified = False
         self.busy = False
 
         self.setup_styles()
         self.create_menu()
         self.create_widgets()
         self.refresh_processes()
+
+    # ---------------------------------------------------------------- мелкие UI-хелперы
+    def _add_entry_context_menu(self, entry):
+        """Два независимых исправления для одного поля ввода:
+
+        1) Ctrl+C/V/X в Tk по умолчанию привязаны к keysym конкретного символа
+           (латинские 'c'/'v'/'x'), а не к физической клавише. При активной русской
+           (или любой не-латинской) раскладке та же физическая клавиша даёт другой
+           keysym — и штатная привязка молча не срабатывает, копипаст как будто
+           "не работает". Лечится привязкой по event.keycode (физический код клавиши,
+           от раскладки не зависит: на Windows 67/86/88/65 = C/V/X/A всегда).
+        2) Явное контекстное меню по правому клику — Entry в Tk само его не показывает
+           (в отличие от нативных полей Windows), плюс это удобная резервная кнопка
+           на случай другой раскладки/ОС, где номера keycode отличаются.
+        """
+        def handle_ctrl_key(event):
+            code = event.keycode
+            if code == 67:      # C
+                entry.event_generate("<<Copy>>")
+                return "break"
+            elif code == 86:    # V
+                entry.event_generate("<<Paste>>")
+                return "break"
+            elif code == 88:    # X
+                entry.event_generate("<<Cut>>")
+                return "break"
+            elif code == 65:    # A
+                entry.select_range(0, "end")
+                entry.icursor("end")
+                return "break"
+
+        entry.bind("<Control-KeyPress>", handle_ctrl_key)
+
+        menu = tk.Menu(self.root, tearoff=0, bg=BG_INPUT, fg=FG_MAIN,
+                        activebackground=BORDER_COLOR, activeforeground=FG_MAIN)
+        menu.add_command(label="Вырезать", command=lambda: entry.event_generate("<<Cut>>"))
+        menu.add_command(label="Копировать", command=lambda: entry.event_generate("<<Copy>>"))
+        menu.add_command(label="Вставить", command=lambda: entry.event_generate("<<Paste>>"))
+        menu.add_separator()
+        menu.add_command(label="Выделить всё",
+                          command=lambda: (entry.select_range(0, "end"), entry.icursor("end")))
+
+        def show_menu(event):
+            entry.focus_set()
+            menu.tk_popup(event.x_root, event.y_root)
+
+        entry.bind("<Button-3>", show_menu)
+        return entry
+
+    def _ask_type_choice(self, title, current=None):
+        """Модальный выбор типа данных кликом по кнопке — вместо ручного ввода строки."""
+        result = {"value": None}
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=BG_CARD)
+        win.transient(self.root)
+        win.grab_set()
+        win.resizable(False, False)
+
+        ttk.Label(win, text="Выберите тип:", background=BG_CARD).pack(padx=14, pady=(12, 6))
+        btns_frame = tk.Frame(win, bg=BG_CARD)
+        btns_frame.pack(padx=14, pady=(0, 14))
+
+        def pick(t):
+            result["value"] = t
+            win.destroy()
+
+        cols = 4
+        for i, t in enumerate(TYPES):
+            style = "Accent.TButton" if t == current else "TButton"
+            b = ttk.Button(btns_frame, text=t, style=style, width=8, command=lambda t=t: pick(t))
+            b.grid(row=i // cols, column=i % cols, padx=3, pady=3)
+
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.wait_window()
+        return result["value"]
+
+    def _ask_pick_from_list(self, title, prompt, items):
+        """Модальный выбор одного варианта из списка строк (например, существующей
+        записи Cheat Table). Возвращает индекс выбранного либо None."""
+        result = {"index": None}
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=BG_CARD)
+        win.transient(self.root)
+        win.grab_set()
+        win.geometry("420x320")
+
+        ttk.Label(win, text=prompt, background=BG_CARD, wraplength=380, justify="left").pack(
+            padx=12, pady=(12, 6), anchor="w")
+
+        list_frame = tk.Frame(win, bg=BG_CARD)
+        list_frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        listbox = tk.Listbox(list_frame, bg=BG_INPUT, fg=FG_MAIN, selectbackground=ACCENT_BLUE,
+                              selectforeground=TEXT_ON_ACCENT, highlightthickness=0, bd=0,
+                              activestyle="none")
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        listbox.configure(yscrollcommand=scrollbar.set)
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        for it in items:
+            listbox.insert("end", it)
+        if items:
+            listbox.selection_set(0)
+
+        def confirm():
+            sel = listbox.curselection()
+            if sel:
+                result["index"] = sel[0]
+            win.destroy()
+
+        btns = tk.Frame(win, bg=BG_CARD)
+        btns.pack(pady=(0, 12))
+        ttk.Button(btns, text="Выбрать", style="Accent.TButton", command=confirm).pack(side="left", padx=4)
+        ttk.Button(btns, text="Отмена", command=win.destroy).pack(side="left", padx=4)
+
+        listbox.bind("<Double-1>", lambda e: confirm())
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.wait_window()
+        return result["index"]
 
     # ---------------------------------------------------------------- styles
     def setup_styles(self):
@@ -510,6 +753,7 @@ class MemoryEditorApp:
         row1.pack(fill="x", pady=(6, 0))
         ttk.Label(row1, text="Фильтр:", background=BG_CARD).pack(side="left")
         self.entry_filter = ttk.Entry(row1, width=16)
+        self._add_entry_context_menu(self.entry_filter)
         self.entry_filter.pack(side="left", padx=4)
         self.entry_filter.bind("<KeyRelease>", self.apply_process_filter)
 
@@ -529,6 +773,7 @@ class MemoryEditorApp:
         row2.pack(fill="x", pady=(6, 0))
         ttk.Label(row2, text="или Spawn-запуск:", background=BG_CARD).pack(side="left")
         self.entry_spawn = ttk.Entry(row2, width=30)
+        self._add_entry_context_menu(self.entry_spawn)
         self.entry_spawn.pack(side="left", padx=4)
         self.entry_spawn.insert(0, "com.example.app")
 
@@ -578,10 +823,12 @@ class MemoryEditorApp:
 
         ttk.Label(r0, text="Значение:", background=BG_CARD).pack(side="left", padx=(8, 0))
         self.entry_val = ttk.Entry(r0, width=12)
+        self._add_entry_context_menu(self.entry_val)
         self.entry_val.pack(side="left", padx=4)
 
         ttk.Label(r0, text="до (для «Между»):", background=BG_CARD).pack(side="left")
         self.entry_val2 = ttk.Entry(r0, width=10)
+        self._add_entry_context_menu(self.entry_val2)
         self.entry_val2.pack(side="left", padx=4)
 
         btn_first = ttk.Button(r0, text="🔍 Первый поиск", style="Accent.TButton",
@@ -638,6 +885,11 @@ class MemoryEditorApp:
         self.result_menu.add_command(label="📋 Скопировать адрес", command=self.copy_selected_address)
         self.result_menu.add_command(label="📌 Добавить в список наблюдения",
                                       command=self.add_selected_to_watch)
+        self.result_menu.add_command(label="🔄 Привязать к существующей записи",
+                                      command=self.relink_existing_watch_entry)
+        self.result_menu.add_separator()
+        self.result_menu.add_command(label="🔬 Инспектировать память (Соседи)",
+                                      command=self.open_memory_inspector)
 
         r2 = tk.Frame(frame_list, bg=BG_CARD)
         r2.pack(fill="x", pady=(4, 0))
@@ -649,6 +901,7 @@ class MemoryEditorApp:
 
         ttk.Label(frame_action, text="Новое значение:", background=BG_CARD).grid(row=0, column=0, padx=4)
         self.entry_new_val = ttk.Entry(frame_action, width=16)
+        self._add_entry_context_menu(self.entry_new_val)
         self.entry_new_val.grid(row=0, column=1, padx=4)
         ttk.Button(frame_action, text="✏️ Записать во все", command=self.set_value_all).grid(
             row=0, column=2, padx=6)
@@ -689,14 +942,22 @@ class MemoryEditorApp:
         tree_container = tk.Frame(frame_list, bg=BG_CARD)
         tree_container.pack(fill="both", expand=True)
 
-        cols = ("Name", "Addr", "Type", "Value", "Frozen")
+        cols = ("Name", "Addr", "Type", "Value", "Anchor", "Frozen")
         self.watch_tree = ttk.Treeview(tree_container, columns=cols, show="headings", height=8)
         headers = {"Name": "Название", "Addr": "Адрес", "Type": "Тип",
-                   "Value": "Значение", "Frozen": "Заморожено"}
-        widths = {"Name": 160, "Addr": 220, "Type": 70, "Value": 120, "Frozen": 90}
+                   "Value": "Значение", "Anchor": "Привязка", "Frozen": "Заморожено"}
+        widths = {"Name": 150, "Addr": 200, "Type": 60, "Value": 110, "Anchor": 170, "Frozen": 90}
         for c in cols:
             self.watch_tree.heading(c, text=headers[c])
             self.watch_tree.column(c, width=widths[c], anchor="center")
+        ToolTip(self.watch_tree,
+                "Колонка «Привязка»:\n"
+                "• module+0xHEX — адрес привязан к загруженному модулю (.so),\n"
+                "   переживёт перезапуск игры (адрес пересчитается заново).\n"
+                "• heap (raw) — обычный адрес в куче, после перезапуска игры\n"
+                "   почти наверняка станет невалидным. Найдите значение заново\n"
+                "   сканером и используйте «🔄 Привязать к существующей записи»\n"
+                "   в результатах поиска — обновит эту запись, без дублей.")
         self.watch_tree.bind("<Double-1>", self.on_watch_double_click)
         self.watch_tree.bind("<Button-3>", self.on_watch_right_click)
 
@@ -708,7 +969,12 @@ class MemoryEditorApp:
         self.watch_menu = tk.Menu(self.root, tearoff=0, bg=BG_INPUT, fg=FG_MAIN,
                                    activebackground=BORDER_COLOR, activeforeground=FG_MAIN)
         self.watch_menu.add_command(label="❄️ Заморозить / разморозить", command=self.watch_toggle_freeze_selected)
+        self.watch_menu.add_command(label="🔁 Сменить тип", command=self.watch_change_type)
         self.watch_menu.add_command(label="📋 Скопировать адрес", command=self.watch_copy_address)
+        self.watch_menu.add_separator()
+        self.watch_menu.add_command(label="🔬 Инспектировать память (Соседи)",
+                                     command=self.open_memory_inspector_from_watch)
+        self.watch_menu.add_separator()
         self.watch_menu.add_command(label="🗑 Удалить", command=self.watch_remove_selected)
 
     # ================================================================== helpers
@@ -790,6 +1056,7 @@ class MemoryEditorApp:
     # ================================================================== подключение
     def _on_connected(self, session, api, status_text="ONLINE"):
         self.session, self.api = session, api
+        self._detach_notified = False
         self.freeze_all_on = False
         self.btn_freeze.config(text="❄️ ЗАМОРОЗИТЬ ВСЕ", bg=BG_INPUT, fg=FG_MAIN)
         self.lbl_status.config(text=status_text, fg=ACCENT_GREEN)
@@ -798,6 +1065,40 @@ class MemoryEditorApp:
         self.match_total = 0
         self.update_tree([])
         self.start_watch_autorefresh()
+
+        # Штатный сигнал Frida: срабатывает один раз, когда сессия отваливается
+        # (процесс закрылся/крашнулся/отключили USB) — без этого self.api
+        # продолжал указывать на мёртвую сессию, а автообновление списка
+        # наблюдения каждые 1.5 сек заваливало messagebox'ами на каждый тик.
+        try:
+            session.on("detached", lambda reason, crash=None:
+                       self.root.after(0, lambda: self._handle_detach(reason, session)))
+        except Exception:
+            pass
+
+    def _handle_detach(self, reason, session):
+        # Игнорируем сигнал, если он пришёл от уже неактуальной (старой) сессии
+        # — например, если пользователь успел переподключиться раньше сигнала.
+        if session is not self.session or self._detach_notified:
+            return
+        self._detach_notified = True
+        self.api = None
+        self.session = None
+        self.freeze_all_on = False
+        self.btn_freeze.config(text="❄️ ЗАМОРОЗИТЬ ВСЕ", bg=BG_INPUT, fg=FG_MAIN)
+
+        reason_ru = {
+            "process-terminated": "процесс завершён",
+            "process-replaced": "процесс заменён (перезапуск?)",
+            "application-requested": "отключено приложением",
+            "server-terminated": "frida-server остановлен",
+            "device-lost": "устройство отключено (USB?)",
+        }.get(reason, str(reason))
+
+        self.lbl_status.config(text=f"OFFLINE ({reason_ru})", fg=ACCENT_RED)
+        messagebox.showinfo("Сессия завершена",
+                             f"Соединение с процессом прервано: {reason_ru}.\n"
+                             f"Подключитесь заново (Attach или Spawn).")
 
     def _detach_current(self):
         if self.session:
@@ -888,7 +1189,7 @@ class MemoryEditorApp:
                     "  и версию бинарника frida-server на устройстве);\n"
                     "• неверный/неточный идентификатор пакета (регистр важен);\n"
                     "• приложение долго стартует или требует доп. разрешений.\n\n"
-                    "sad.")
+                    "Попробуйте кнопку «⏳ Ждать запуск» — она надёжнее в таких случаях.")
             messagebox.showerror("Ошибка Frida (spawn)", msg)
 
         self.run_async(work, done, error)
@@ -1053,6 +1354,236 @@ class MemoryEditorApp:
 
         self.run_async(work, done)
 
+    # ================================================================== инспектор памяти (соседи)
+    def open_memory_inspector(self):
+        sel = self.tree.selection()
+        if not sel or not self.require_api():
+            return
+        base_addr = self.tree.item(sel[0], "values")[0]
+        self._build_inspector_window(base_addr)
+
+    # ================================================================== перепривязка записи
+    def relink_existing_watch_entry(self):
+        """Вместо создания дубликата в Cheat Table — привязывает УЖЕ существующую запись
+        к свеженайденному адресу. Основной сценарий: перезапустили игру, заново нашли
+        heap-значение сканером, и хотите обновить им старую (уже невалидную) запись,
+        а не плодить новые с тем же именем."""
+        sel = self.tree.selection()
+        if not sel or not self.require_api():
+            return
+        new_addr, new_val = self.tree.item(sel[0], "values")
+
+        def work():
+            return self.api.watch_list()
+
+        def done(entries):
+            if not entries:
+                messagebox.showinfo(
+                    "Список наблюдения пуст",
+                    "В Cheat Table пока нет записей — сначала добавьте хотя бы одну "
+                    "через «📌 Добавить в список наблюдения».")
+                return
+            labels = [f"{e['name']}  —  {e['type']}, {e['address']}" for e in entries]
+            idx = self._ask_pick_from_list(
+                "Привязать к записи",
+                "Какую существующую запись обновить этим новым адресом?",
+                labels)
+            if idx is None:
+                return
+            old_addr = entries[idx]["address"]
+
+            def work2():
+                return self.api.watch_update_address(old_addr, new_addr)
+
+            def done2(_r):
+                self.refresh_watchlist()
+
+            self.run_async(work2, done2)
+
+        self.run_async(work, done)
+
+    def _build_inspector_window(self, base_addr):
+        win = tk.Toplevel(self.root)
+        win.title(f"🔬 Инспектор памяти — {base_addr}")
+        win.configure(bg=BG_MAIN)
+        win.geometry("980x560")
+        win.minsize(760, 420)
+        win.transient(self.root)
+        win.grab_set()
+
+        frm = ttk.LabelFrame(win, text=f" База: {base_addr} ", padding=8)
+        frm.pack(fill="x", padx=10, pady=8)
+
+        row1 = tk.Frame(frm, bg=BG_CARD)
+        row1.pack(fill="x")
+        ttk.Label(row1, text="Начало:", background=BG_CARD).pack(side="left")
+        entry_start = ttk.Entry(row1, width=10)
+        self._add_entry_context_menu(entry_start)
+        entry_start.insert(0, "-0x100")
+        entry_start.pack(side="left", padx=4)
+
+        ttk.Label(row1, text="Конец:", background=BG_CARD).pack(side="left")
+        entry_end = ttk.Entry(row1, width=10)
+        self._add_entry_context_menu(entry_end)
+        entry_end.insert(0, "+0x200")
+        entry_end.pack(side="left", padx=4)
+
+        ttk.Label(row1, text="Шаг:", background=BG_CARD).pack(side="left")
+        combo_step = ttk.Combobox(row1, values=["1", "2", "4", "8"], width=4, state="readonly")
+        combo_step.set("4")
+        combo_step.pack(side="left", padx=4)
+
+        btn_scan = ttk.Button(row1, text="🔬 Сканировать", style="Accent.TButton",
+                               command=lambda: do_scan())
+        btn_scan.pack(side="left", padx=8)
+        ToolTip(btn_scan,
+                "Читает память вокруг базового адреса в диапазоне\n"
+                "[Начало; Конец] с заданным шагом выравнивания и\n"
+                "показывает значение каждой ячейки сразу во всех типах —\n"
+                "чтобы не пропустить нужную интерпретацию.\n"
+                "Полезно для поиска соседних полей структуры (например,\n"
+                "max HP рядом с текущим HP).")
+
+        row2 = tk.Frame(frm, bg=BG_CARD)
+        row2.pack(fill="x", pady=(6, 0))
+        ttk.Label(row2, text="Быстрый фильтр:", background=BG_CARD).pack(side="left")
+        entry_filter = ttk.Entry(row2, width=16)
+        self._add_entry_context_menu(entry_filter)
+        entry_filter.pack(side="left", padx=4)
+        ToolTip(entry_filter, "Введите число — совпадающие строки (в любой из числовых\nколонок) будут подсвечены розовым.")
+
+        frame_list = ttk.LabelFrame(
+            win, text=" Соседние ячейки (двойной клик по числовой ячейке = добавить в список наблюдения) ",
+            padding=6)
+        frame_list.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        tree_container = tk.Frame(frame_list, bg=BG_CARD)
+        tree_container.pack(fill="both", expand=True)
+
+        cols = ("Offset", "Addr", "Byte", "Int16", "Int32", "Int64", "Float", "Double", "Pointer")
+        headers = {"Offset": "Офсет", "Addr": "Адрес", "Byte": "Byte", "Int16": "Int16",
+                   "Int32": "Int32", "Int64": "Int64", "Float": "Float", "Double": "Double",
+                   "Pointer": "Pointer"}
+        widths = {"Offset": 60, "Addr": 130, "Byte": 50, "Int16": 60, "Int32": 80,
+                  "Int64": 110, "Float": 80, "Double": 90, "Pointer": 130}
+        # Колонки, по двойному клику на которые можно добавить значение в Cheat Table
+        # именно с этим типом (Addr/Offset клики игнорируются).
+        value_cols = ("Byte", "Int16", "Int32", "Int64", "Float", "Double")
+
+        insp_tree = ttk.Treeview(tree_container, columns=cols, show="headings", height=16)
+        for c in cols:
+            insp_tree.heading(c, text=headers[c])
+            insp_tree.column(c, width=widths[c], anchor="center")
+        insp_tree.tag_configure("hit", background=ACCENT_BLUE, foreground=TEXT_ON_ACCENT)
+
+        scrollbar = ttk.Scrollbar(tree_container, orient="vertical", command=insp_tree.yview)
+        insp_tree.configure(yscrollcommand=scrollbar.set)
+        insp_tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        def parse_offset(text):
+            text = text.strip().replace(" ", "")
+            if not text:
+                raise ValueError("empty offset")
+            if not text.lstrip("+-").lower().startswith("0x"):
+                raise ValueError("expected hex, e.g. -0x100")
+            return int(text, 16)
+
+        def do_scan():
+            try:
+                start = parse_offset(entry_start.get())
+                end = parse_offset(entry_end.get())
+            except ValueError:
+                messagebox.showwarning("Ошибка", "Смещения должны быть в HEX-формате, например -0x100 / +0x200",
+                                        parent=win)
+                return
+            step = int(combo_step.get())
+            if start > end:
+                messagebox.showwarning("Ошибка", "Начальное смещение больше конечного", parent=win)
+                return
+
+            def work():
+                return self.api.inspect_memory(base_addr, start, end, step)
+
+            def done(result):
+                if isinstance(result, dict) and result.get("error"):
+                    err = result["error"]
+                    if err == "too_many":
+                        messagebox.showwarning(
+                            "Слишком большой диапазон",
+                            f"При таком диапазоне и шаге получится {result.get('count')} ячеек "
+                            f"(лимит — 5000). Уменьшите диапазон или увеличьте шаг.", parent=win)
+                    else:
+                        messagebox.showerror("Ошибка", f"Не удалось прочитать память ({err})", parent=win)
+                    return
+
+                for r in insp_tree.get_children():
+                    insp_tree.delete(r)
+
+                def fmt(v):
+                    return "—" if v is None else v
+
+                for row in result.get("rows", []):
+                    off = row["offset"]
+                    off_str = ("+0x%X" % off) if off >= 0 else ("-0x%X" % -off)
+                    insp_tree.insert("", "end", values=(
+                        off_str, row["address"],
+                        fmt(row["byte"]), fmt(row["int16"]), fmt(row["int32"]), fmt(row["int64"]),
+                        fmt(row["float"]), fmt(row["double"]), fmt(row["pointer"])))
+                apply_filter()
+
+            self.run_async(work, done)
+
+        def apply_filter(_event=None):
+            query = entry_filter.get().strip()
+            for iid in insp_tree.get_children():
+                vals = insp_tree.item(iid, "values")
+                hit = bool(query) and query in [str(v) for v in vals[2:8]]  # Byte..Double
+                insp_tree.item(iid, tags=("hit",) if hit else ())
+
+        entry_filter.bind("<KeyRelease>", apply_filter)
+
+        def on_double_click(event):
+            sel2 = insp_tree.selection()
+            if not sel2 or not self.api:
+                return
+            col_id = insp_tree.identify_column(event.x)
+            try:
+                col_index = int(col_id.replace("#", "")) - 1
+            except ValueError:
+                return
+            if col_index < 0 or col_index >= len(cols):
+                return
+            col_name = cols[col_index]
+            if col_name not in value_cols:
+                return  # клик по Offset/Addr/Pointer — не тип для добавления
+
+            row_vals = insp_tree.item(sel2[0], "values")
+            row_dict = dict(zip(cols, row_vals))
+            picked_val = row_dict[col_name]
+            if picked_val == "—":
+                messagebox.showinfo("Нет значения", "Ячейка недоступна для чтения по этому типу.", parent=win)
+                return
+
+            default_name = f"{base_addr}{row_dict['Offset']}"
+            name = simpledialog.askstring(
+                "Название", f"Тип: {col_name}, значение: {picked_val}\nИмя для списка наблюдения:",
+                initialvalue=default_name, parent=win)
+            if name is None:
+                return
+
+            def work2():
+                return self.api.watch_add(row_dict["Addr"], col_name.lower(), name, str(picked_val))
+
+            def done2(_r):
+                self.refresh_watchlist()
+
+            self.run_async(work2, done2)
+
+        insp_tree.bind("<Double-1>", on_double_click)
+
+        do_scan()
+
     # ================================================================== модификация всех
     def set_value_all(self):
         if not self.require_api():
@@ -1105,9 +1636,8 @@ class MemoryEditorApp:
         addr = simpledialog.askstring("Адрес", "Введите адрес (например 0x7f1234abcd):")
         if not addr:
             return
-        t_type = simpledialog.askstring("Тип", f"Тип ({'/'.join(TYPES)}):", initialvalue="int32")
-        if t_type not in TYPES:
-            messagebox.showwarning("Ошибка", "Неизвестный тип данных.")
+        t_type = self._ask_type_choice("Тип данных", current="int32")
+        if t_type is None:
             return
         name = simpledialog.askstring("Название", "Имя:", initialvalue=addr) or addr
 
@@ -1123,7 +1653,7 @@ class MemoryEditorApp:
         sel = self.watch_tree.selection()
         if not sel or not self.api:
             return
-        name, addr, t_type, old_val, _frozen = self.watch_tree.item(sel[0], "values")
+        name, addr, t_type, old_val, *_ = self.watch_tree.item(sel[0], "values")
         new_val = simpledialog.askstring("Изменить значение", f"{name}\nНовое значение:",
                                           initialvalue=str(old_val))
         if new_val is None:
@@ -1154,6 +1684,30 @@ class MemoryEditorApp:
 
         self.run_async(work, done)
 
+    def watch_change_type(self):
+        sel = self.watch_tree.selection()
+        if not sel or not self.api:
+            return
+        name, addr, cur_type, *_ = self.watch_tree.item(sel[0], "values")
+        new_type = self._ask_type_choice(f"Сменить тип — {name}", current=cur_type)
+        if new_type is None:
+            return
+
+        def work():
+            return self.api.watch_set_type(addr, new_type)
+
+        def done(_r):
+            self.refresh_watchlist()
+
+        self.run_async(work, done)
+
+    def open_memory_inspector_from_watch(self):
+        sel = self.watch_tree.selection()
+        if not sel or not self.require_api():
+            return
+        addr = self.watch_tree.item(sel[0], "values")[1]
+        self._build_inspector_window(addr)
+
     def watch_remove_selected(self):
         sel = self.watch_tree.selection()
         if not sel or not self.api:
@@ -1172,7 +1726,8 @@ class MemoryEditorApp:
         sel = self.watch_tree.selection()
         if not sel or not self.api:
             return
-        _name, addr, _t, _v, frozen = self.watch_tree.item(sel[0], "values")
+        vals = self.watch_tree.item(sel[0], "values")
+        addr, frozen = vals[1], vals[-1]
         new_state = frozen != "✓"
 
         def work():
@@ -1200,7 +1755,7 @@ class MemoryEditorApp:
             self.watch_tree.selection_set(row)
             self.watch_menu.tk_popup(event.x_root, event.y_root)
 
-    def refresh_watchlist(self, animate=True):
+    def refresh_watchlist(self, animate=True, silent=False):
         if not self.api:
             return
 
@@ -1216,7 +1771,11 @@ class MemoryEditorApp:
             for e in entries:
                 iid = e["address"]
                 seen.add(iid)
-                vals = (e["name"], e["address"], e["type"], e["value"],
+                if e.get("module"):
+                    anchor = f"{e['module']}+{e['offset']}"
+                else:
+                    anchor = "heap (raw)"
+                vals = (e["name"], e["address"], e["type"], e["value"], anchor,
                         "✓" if e["frozen"] else "—")
                 if self.watch_tree.exists(iid):
                     self.watch_tree.item(iid, values=vals)
@@ -1225,7 +1784,12 @@ class MemoryEditorApp:
             for iid in existing - seen:
                 self.watch_tree.delete(iid)
 
-        self.run_async(work, done, animate=animate)
+        # silent=True используется для фонового автообновления: если сессия
+        # умерла буквально за миг до срабатывания сигнала 'detached', не нужно
+        # показывать messagebox на каждый неудачный тик — статус и так скоро
+        # обновится через _handle_detach.
+        on_error = (lambda _e: None) if silent else None
+        self.run_async(work, done, on_error=on_error, animate=animate)
 
     def start_watch_autorefresh(self):
         if self._watch_job:
@@ -1233,7 +1797,7 @@ class MemoryEditorApp:
 
         def tick():
             if self.api and self.watch_autorefresh.get() and not self.busy:
-                self.refresh_watchlist(animate=False)
+                self.refresh_watchlist(animate=False, silent=True)
             self._watch_job = self.root.after(1500, tick)
 
         self._watch_job = self.root.after(1500, tick)
